@@ -107,7 +107,7 @@ class HOTAAdapter(BaseMetricAdapter):
         csv_df = csv_df.sort_values("t").reset_index(drop=True)
 
         id_to_track = {}
-        next_track_id = 1
+        next_track_id = 0
 
         for _, row in csv_df.iterrows():
             id_ = int(row["id"])
