@@ -30,10 +30,10 @@ class HOTAAdapter(BaseMetricAdapter):
     target_dataset : str
         Name of the dataset containing ground truth segmentation (shape: C T Y X, C=1).
     pred_csv_path : str or Path
-        Path to predicted tracks CSV with columns: sequence, id, time, y, x, parent_id
+        Path to predicted tracks CSV with columns: sequence, id, t, y, x, parent_id
         (may have additional columns which will be dropped).
     target_csv_path : str or Path
-        Path to ground truth tracks CSV with columns: sequence, id, time, y, x, parent_id
+        Path to ground truth tracks CSV with columns: sequence, id, t, y, x, parent_id
         (may have additional columns which will be dropped).
     iou_threshold : float, optional
         IoU threshold for considering a detection as matched. Default is 0.5.
@@ -65,10 +65,12 @@ class HOTAAdapter(BaseMetricAdapter):
         Filters rows where sequence == group and keeps only required columns.
         """
         df = pd.read_csv(csv_path)
+        # Handle '# ' prefix in header (first column may be '# sequence')
+        df.columns = [col.lstrip("# ") for col in df.columns]
         # Filter by sequence matching group
         df = df[df["sequence"] == self.group].copy()
         # Keep only required columns
-        df = df[["id", "time", "y", "x", "parent_id"]]
+        df = df[["id", "t", "y", "x", "parent_id"]]
         return df
 
     def _load_data(self) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
@@ -96,8 +98,8 @@ class HOTAAdapter(BaseMetricAdapter):
         dict
             Mapping from id to track_id.
         """
-        # Sort by time to process in temporal order
-        csv_df = csv_df.sort_values("time").reset_index(drop=True)
+        # Sort by t to process in temporal order
+        csv_df = csv_df.sort_values("t").reset_index(drop=True)
 
         id_to_track = {}
         next_track_id = 1
