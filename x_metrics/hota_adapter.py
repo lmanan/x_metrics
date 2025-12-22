@@ -30,9 +30,11 @@ class HOTAAdapter(BaseMetricAdapter):
     target_dataset : str
         Name of the dataset containing ground truth segmentation (shape: C T Y X, C=1).
     pred_csv_path : str or Path
-        Path to predicted tracks CSV with columns: unique_id, time, y, x, parent_id.
+        Path to predicted tracks CSV with columns: sequence, id, time, y, x, parent_id
+        (may have additional columns which will be dropped).
     target_csv_path : str or Path
-        Path to ground truth tracks CSV with columns: unique_id, time, y, x, parent_id.
+        Path to ground truth tracks CSV with columns: sequence, id, time, y, x, parent_id
+        (may have additional columns which will be dropped).
     iou_threshold : float, optional
         IoU threshold for considering a detection as matched. Default is 0.5.
     """
@@ -57,6 +59,18 @@ class HOTAAdapter(BaseMetricAdapter):
 
         self._hota_metric = HOTA()
 
+    def _load_csv(self, csv_path: Path) -> pd.DataFrame:
+        """Load and filter CSV tracking data.
+
+        Filters rows where sequence == group and keeps only required columns.
+        """
+        df = pd.read_csv(csv_path)
+        # Filter by sequence matching group
+        df = df[df["sequence"] == self.group].copy()
+        # Keep only required columns
+        df = df[["id", "time", "y", "x", "parent_id"]]
+        return df
+
     def _load_data(self) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
         """Load zarr arrays and CSV tracking data."""
         root = zarr.open(self.zarr_path, mode="r")
@@ -66,12 +80,12 @@ class HOTAAdapter(BaseMetricAdapter):
         pred_arr = np.asarray(group[self.pred_dataset][0])
         target_arr = np.asarray(group[self.target_dataset][0])
 
-        pred_csv = pd.read_csv(self.pred_csv_path)
-        target_csv = pd.read_csv(self.target_csv_path)
+        pred_csv = self._load_csv(self.pred_csv_path)
+        target_csv = self._load_csv(self.target_csv_path)
 
         return pred_arr, target_arr, pred_csv, target_csv
 
-    def _build_tracks(self, csv_df: pd.DataFrame) -> dict[int, list[int]]:
+    def _build_tracks(self, csv_df: pd.DataFrame) -> dict[int, int]:
         """Build track ID mapping from CSV.
 
         Each detection gets assigned to a track. Detections with parent_id=0
@@ -80,31 +94,31 @@ class HOTAAdapter(BaseMetricAdapter):
         Returns
         -------
         dict
-            Mapping from unique_id to track_id.
+            Mapping from id to track_id.
         """
         # Sort by time to process in temporal order
         csv_df = csv_df.sort_values("time").reset_index(drop=True)
 
-        unique_id_to_track = {}
+        id_to_track = {}
         next_track_id = 1
 
         for _, row in csv_df.iterrows():
-            unique_id = int(row["unique_id"])
+            id_ = int(row["id"])
             parent_id = int(row["parent_id"])
 
             if parent_id == 0:
                 # New track starts
-                unique_id_to_track[unique_id] = next_track_id
+                id_to_track[id_] = next_track_id
                 next_track_id += 1
             else:
                 # Continue parent's track (or start new if parent not found)
-                if parent_id in unique_id_to_track:
-                    unique_id_to_track[unique_id] = unique_id_to_track[parent_id]
+                if parent_id in id_to_track:
+                    id_to_track[id_] = id_to_track[parent_id]
                 else:
-                    unique_id_to_track[unique_id] = next_track_id
+                    id_to_track[id_] = next_track_id
                     next_track_id += 1
 
-        return unique_id_to_track
+        return id_to_track
 
     def _compute_iou_matrix(
         self,
@@ -142,14 +156,14 @@ class HOTAAdapter(BaseMetricAdapter):
     ) -> dict[str, Any]:
         """Prepare data in TrackEval HOTA format."""
         # Build track mappings
-        pred_unique_to_track = self._build_tracks(pred_csv)
-        target_unique_to_track = self._build_tracks(target_csv)
+        pred_id_to_track = self._build_tracks(pred_csv)
+        target_id_to_track = self._build_tracks(target_csv)
 
         n_frames = pred_arr.shape[0]
 
         # Collect unique track IDs
-        gt_track_ids = set(target_unique_to_track.values())
-        pred_track_ids = set(pred_unique_to_track.values())
+        gt_track_ids = set(target_id_to_track.values())
+        pred_track_ids = set(pred_id_to_track.values())
 
         # Initialize accumulators
         data = {
@@ -173,10 +187,10 @@ class HOTAAdapter(BaseMetricAdapter):
 
             # Map to track IDs
             gt_track_ids_frame = np.array(
-                [target_unique_to_track.get(uid, -1) for uid in target_ids_in_frame]
+                [target_id_to_track.get(id_, -1) for id_ in target_ids_in_frame]
             )
             pred_track_ids_frame = np.array(
-                [pred_unique_to_track.get(uid, -1) for uid in pred_ids_in_frame]
+                [pred_id_to_track.get(id_, -1) for id_ in pred_ids_in_frame]
             )
 
             # Filter out unmapped IDs
