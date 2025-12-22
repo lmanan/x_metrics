@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import zarr
+from tqdm import tqdm
 from trackeval.metrics import HOTA
 
 from x_metrics.base_adapter import BaseMetricAdapter
@@ -183,7 +184,7 @@ class HOTAAdapter(BaseMetricAdapter):
             "similarity_scores": [],
         }
 
-        for t in range(n_frames):
+        for t in tqdm(range(n_frames), desc="Processing frames"):
             pred_frame = pred_arr[t]
             target_frame = target_arr[t]
 
