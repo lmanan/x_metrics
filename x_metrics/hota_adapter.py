@@ -64,9 +64,13 @@ class HOTAAdapter(BaseMetricAdapter):
 
         Filters rows where sequence == group and keeps only required columns.
         """
-        df = pd.read_csv(csv_path)
-        # Handle '# ' prefix in header (first column may be '# sequence')
-        df.columns = [col.lstrip("# ") for col in df.columns]
+        df = pd.read_csv(csv_path, sep=r"\s+", comment="#", header=0)
+        # Read the header separately to get column names (first line starts with #)
+        with open(csv_path) as f:
+            header_line = f.readline().strip()
+        if header_line.startswith("#"):
+            columns = header_line.lstrip("#").split()
+            df.columns = columns
         # Filter by sequence matching group
         df = df[df["sequence"] == self.group].copy()
         # Keep only required columns
