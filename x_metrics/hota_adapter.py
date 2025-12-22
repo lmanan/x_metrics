@@ -21,10 +21,14 @@ class HOTAAdapter(BaseMetricAdapter):
 
     Parameters
     ----------
-    pred_zarr_path : str or Path
-        Path to predicted segmentation zarr (shape: C T Y X, C=1).
-    target_zarr_path : str or Path
-        Path to ground truth segmentation zarr (shape: C T Y X, C=1).
+    zarr_path : str or Path
+        Path to zarr container.
+    group : str
+        Name of the group containing prediction and target datasets.
+    pred_dataset : str
+        Name of the dataset containing predicted segmentation (shape: C T Y X, C=1).
+    target_dataset : str
+        Name of the dataset containing ground truth segmentation (shape: C T Y X, C=1).
     pred_csv_path : str or Path
         Path to predicted tracks CSV with columns: unique_id, time, y, x, parent_id.
     target_csv_path : str or Path
@@ -35,14 +39,18 @@ class HOTAAdapter(BaseMetricAdapter):
 
     def __init__(
         self,
-        pred_zarr_path: str | Path,
-        target_zarr_path: str | Path,
+        zarr_path: str | Path,
+        group: str,
+        pred_dataset: str,
+        target_dataset: str,
         pred_csv_path: str | Path,
         target_csv_path: str | Path,
         iou_threshold: float = 0.5,
     ):
-        self.pred_zarr_path = Path(pred_zarr_path)
-        self.target_zarr_path = Path(target_zarr_path)
+        self.zarr_path = Path(zarr_path)
+        self.group = group
+        self.pred_dataset = pred_dataset
+        self.target_dataset = target_dataset
         self.pred_csv_path = Path(pred_csv_path)
         self.target_csv_path = Path(target_csv_path)
         self.iou_threshold = iou_threshold
@@ -51,18 +59,12 @@ class HOTAAdapter(BaseMetricAdapter):
 
     def _load_data(self) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
         """Load zarr arrays and CSV tracking data."""
-        pred_zarr = zarr.open(self.pred_zarr_path, mode="r")
-        target_zarr = zarr.open(self.target_zarr_path, mode="r")
+        root = zarr.open(self.zarr_path, mode="r")
+        group = root[self.group]
 
-        # Handle zarr as array or group
-        pred_arr = np.asarray(
-            pred_zarr[0] if isinstance(pred_zarr, zarr.Array) else pred_zarr["data"][0]
-        )
-        target_arr = np.asarray(
-            target_zarr[0]
-            if isinstance(target_zarr, zarr.Array)
-            else target_zarr["data"][0]
-        )
+        # Load datasets and take first channel (C=1)
+        pred_arr = np.asarray(group[self.pred_dataset][0])
+        target_arr = np.asarray(group[self.target_dataset][0])
 
         pred_csv = pd.read_csv(self.pred_csv_path)
         target_csv = pd.read_csv(self.target_csv_path)

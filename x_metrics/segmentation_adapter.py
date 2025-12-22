@@ -18,10 +18,14 @@ class SegmentationAdapter(BaseMetricAdapter):
 
     Parameters
     ----------
-    pred_zarr_path : str or Path
-        Path to predicted segmentation zarr (shape: C T Y X, C=1).
-    target_zarr_path : str or Path
-        Path to ground truth segmentation zarr (shape: C T Y X, C=1).
+    zarr_path : str or Path
+        Path to zarr container.
+    group : str
+        Name of the group containing prediction and target datasets.
+    pred_dataset : str
+        Name of the dataset containing predicted segmentation (shape: C T Y X, C=1).
+    target_dataset : str
+        Name of the dataset containing ground truth segmentation (shape: C T Y X, C=1).
     thresh : float or tuple of float, optional
         IoU threshold(s) for considering a match. Default is 0.5.
     criterion : str, optional
@@ -37,16 +41,20 @@ class SegmentationAdapter(BaseMetricAdapter):
 
     def __init__(
         self,
-        pred_zarr_path: str | Path,
-        target_zarr_path: str | Path,
+        zarr_path: str | Path,
+        group: str,
+        pred_dataset: str,
+        target_dataset: str,
         thresh: float | tuple[float, ...] = 0.5,
         criterion: str = "iou",
         by_image: bool = False,
         show_progress: bool = True,
         parallel: bool = False,
     ):
-        self.pred_zarr_path = Path(pred_zarr_path)
-        self.target_zarr_path = Path(target_zarr_path)
+        self.zarr_path = Path(zarr_path)
+        self.group = group
+        self.pred_dataset = pred_dataset
+        self.target_dataset = target_dataset
         self.thresh = thresh
         self.criterion = criterion
         self.by_image = by_image
@@ -55,19 +63,12 @@ class SegmentationAdapter(BaseMetricAdapter):
 
     def _load_data(self) -> tuple[np.ndarray, np.ndarray]:
         """Load zarr arrays as numpy arrays."""
-        pred_zarr = zarr.open(self.pred_zarr_path, mode="r")
-        target_zarr = zarr.open(self.target_zarr_path, mode="r")
+        root = zarr.open(self.zarr_path, mode="r")
+        group = root[self.group]
 
-        # Handle zarr as array or group, take first channel (C=1)
-        if isinstance(pred_zarr, zarr.Array):
-            pred_arr = np.asarray(pred_zarr[0], dtype=np.uint32)
-        else:
-            pred_arr = np.asarray(pred_zarr["data"][0], dtype=np.uint32)
-
-        if isinstance(target_zarr, zarr.Array):
-            target_arr = np.asarray(target_zarr[0], dtype=np.uint32)
-        else:
-            target_arr = np.asarray(target_zarr["data"][0], dtype=np.uint32)
+        # Load datasets and take first channel (C=1)
+        pred_arr = np.asarray(group[self.pred_dataset][0], dtype=np.uint32)
+        target_arr = np.asarray(group[self.target_dataset][0], dtype=np.uint32)
 
         return pred_arr, target_arr
 

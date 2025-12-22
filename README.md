@@ -18,8 +18,10 @@ Compute IoU-based matching metrics (precision, recall, F1, accuracy) between pre
 from x_metrics import SegmentationAdapter
 
 adapter = SegmentationAdapter(
-    pred_zarr_path="path/to/predictions.zarr",
-    target_zarr_path="path/to/ground_truth.zarr",
+    zarr_path="path/to/data.zarr",
+    group="experiment_01",
+    pred_dataset="predictions",
+    target_dataset="ground_truth",
     thresh=0.5,  # IoU threshold for considering a match
 )
 
@@ -38,8 +40,10 @@ Evaluate at multiple IoU thresholds simultaneously:
 
 ```python
 adapter = SegmentationAdapter(
-    pred_zarr_path="predictions.zarr",
-    target_zarr_path="ground_truth.zarr",
+    zarr_path="data.zarr",
+    group="experiment_01",
+    pred_dataset="predictions",
+    target_dataset="ground_truth",
     thresh=(0.5, 0.75, 0.9),
 )
 
@@ -53,8 +57,10 @@ for r in results:
 
 ```python
 adapter = SegmentationAdapter(
-    pred_zarr_path="predictions.zarr",
-    target_zarr_path="ground_truth.zarr",
+    zarr_path="data.zarr",
+    group="experiment_01",
+    pred_dataset="predictions",
+    target_dataset="ground_truth",
     thresh=0.5,
     by_image=True,      # Average metrics per frame (default: global)
     show_progress=True, # Show progress bar
@@ -68,7 +74,7 @@ Compute Higher Order Tracking Accuracy (HOTA) metrics for evaluating object trac
 
 #### Data Format
 
-- **Zarr files**: Instance segmentation masks with shape `(C, T, Y, X)` where `C=1`
+- **Zarr datasets**: Instance segmentation masks with shape `(C, T, Y, X)` where `C=1`
 - **CSV files**: Track information with columns:
   - `unique_id`: Unique identifier for each object
   - `time`: Frame/time index
@@ -79,8 +85,10 @@ Compute Higher Order Tracking Accuracy (HOTA) metrics for evaluating object trac
 from x_metrics import HOTAAdapter
 
 adapter = HOTAAdapter(
-    pred_zarr_path="path/to/pred_segmentation.zarr",
-    target_zarr_path="path/to/gt_segmentation.zarr",
+    zarr_path="path/to/data.zarr",
+    group="experiment_01",
+    pred_dataset="predictions",
+    target_dataset="ground_truth",
     pred_csv_path="path/to/pred_tracks.csv",
     target_csv_path="path/to/gt_tracks.csv",
     iou_threshold=0.5,
