@@ -1,4 +1,4 @@
-"""HOTA (Higher Order Tracking Accuracy) metric adapter using TrackEval."""
+"""HOTA and Identity metrics adapter using TrackEval."""
 
 from pathlib import Path
 from typing import Any
@@ -7,18 +7,23 @@ import numpy as np
 import pandas as pd
 import zarr
 from tqdm import tqdm
-from trackeval.metrics import HOTA
+from trackeval.metrics import HOTA, Identity
 
 from x_metrics.base_adapter import BaseMetricAdapter
 
 
 class HOTAAdapter(BaseMetricAdapter):
-    """Adapter for computing HOTA metric on zarr segmentation data with CSV tracks.
+    """Adapter for computing HOTA and Identity metrics on zarr segmentation data with CSV tracks.
 
     HOTA decomposes tracking performance into:
     - DetA (Detection Accuracy): How well objects are detected
     - AssA (Association Accuracy): How well objects are associated across time
     - HOTA = sqrt(DetA * AssA)
+
+    Identity metrics measure ID consistency:
+    - IDF1: Identity F1 score (harmonic mean of IDP and IDR)
+    - IDP: Identity Precision
+    - IDR: Identity Recall
 
     Parameters
     ----------
@@ -59,6 +64,7 @@ class HOTAAdapter(BaseMetricAdapter):
         self.iou_threshold = iou_threshold
 
         self._hota_metric = HOTA()
+        self._identity_metric = Identity()
 
     def _load_csv(self, csv_path: Path) -> pd.DataFrame:
         """Load and filter CSV tracking data.
@@ -227,12 +233,12 @@ class HOTAAdapter(BaseMetricAdapter):
         return data
 
     def compute(self) -> dict[str, Any]:
-        """Compute HOTA metric.
+        """Compute HOTA and Identity metrics.
 
         Returns
         -------
         dict
-            Dictionary containing HOTA metrics:
+            Dictionary containing tracking metrics:
             - HOTA: Main HOTA score (geometric mean of DetA and AssA)
             - DetA: Detection accuracy
             - AssA: Association accuracy
@@ -241,19 +247,34 @@ class HOTAAdapter(BaseMetricAdapter):
             - AssRe: Association recall
             - AssPr: Association precision
             - LocA: Localization accuracy
+            - IDF1: Identity F1 score
+            - IDP: Identity precision
+            - IDR: Identity recall
         """
         pred_arr, target_arr, pred_csv, target_csv = self._load_data()
         data = self._prepare_trackeval_data(pred_arr, target_arr, pred_csv, target_csv)
 
         # Run HOTA computation
-        results = self._hota_metric.eval_sequence(data)
+        hota_results = self._hota_metric.eval_sequence(data)
 
-        # Extract key metrics (averaged over alpha thresholds)
+        # Run Identity computation
+        identity_results = self._identity_metric.eval_sequence(data)
+
+        # Extract key HOTA metrics (averaged over alpha thresholds)
         output = {}
         for key in ["HOTA", "DetA", "AssA", "DetRe", "DetPr", "AssRe", "AssPr", "LocA"]:
-            if key in results:
+            if key in hota_results:
                 # HOTA returns arrays for different alpha thresholds, take mean
-                values = results[key]
+                values = hota_results[key]
+                if isinstance(values, np.ndarray):
+                    output[key] = float(np.mean(values))
+                else:
+                    output[key] = float(values)
+
+        # Extract Identity metrics (IDF1, IDP, IDR)
+        for key in ["IDF1", "IDP", "IDR"]:
+            if key in identity_results:
+                values = identity_results[key]
                 if isinstance(values, np.ndarray):
                     output[key] = float(np.mean(values))
                 else:
@@ -261,11 +282,11 @@ class HOTAAdapter(BaseMetricAdapter):
 
         # Also include per-alpha results for detailed analysis
         output["per_alpha"] = {
-            key: results[key].tolist()
-            if isinstance(results.get(key), np.ndarray)
-            else results.get(key)
+            key: hota_results[key].tolist()
+            if isinstance(hota_results.get(key), np.ndarray)
+            else hota_results.get(key)
             for key in ["HOTA", "DetA", "AssA"]
-            if key in results
+            if key in hota_results
         }
 
         return output
