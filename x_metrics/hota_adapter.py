@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import zarr
+from data_utils import load_csv_data
 from tqdm import tqdm
 from trackeval.metrics import HOTA, Identity
 
@@ -66,25 +66,22 @@ class HOTAAdapter(BaseMetricAdapter):
         self._hota_metric = HOTA()
         self._identity_metric = Identity()
 
-    def _load_csv(self, csv_path: Path) -> pd.DataFrame:
+    def _load_csv(self, csv_path: Path) -> np.ndarray:
         """Load and filter CSV tracking data.
 
-        Filters rows where sequence == group and keeps only required columns.
-        """
-        df = pd.read_csv(csv_path, sep=r"\s+", comment="#", header=0)
-        # Read the header separately to get column names (first line starts with #)
-        with open(csv_path) as f:
-            header_line = f.readline().strip()
-        if header_line.startswith("#"):
-            columns = header_line.lstrip("#").split()
-            df.columns = columns
-        # Filter by sequence matching group
-        df = df[df["sequence"] == self.group].copy()
-        # Keep only required columns
-        df = df[["id", "t", "y", "x", "parent_id"]]
-        return df
+        Filters rows where sequence == group.
 
-    def _load_data(self) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
+        Returns
+        -------
+        np.ndarray
+            Numerical data array with columns [id, t, y, x, parent_id].
+        """
+        numerical_data, _, _, _ = load_csv_data(
+            str(csv_path), sequences=[self.group]
+        )
+        return numerical_data
+
+    def _load_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Load zarr arrays and CSV tracking data."""
         root = zarr.open(self.zarr_path, mode="r")
         group = root[self.group]
@@ -98,26 +95,32 @@ class HOTAAdapter(BaseMetricAdapter):
 
         return pred_arr, target_arr, pred_csv, target_csv
 
-    def _build_tracks(self, csv_df: pd.DataFrame) -> dict[int, int]:
-        """Build track ID mapping from CSV.
+    def _build_tracks(self, csv_data: np.ndarray) -> dict[int, int]:
+        """Build track ID mapping from CSV data.
 
         Each detection gets assigned to a track. Detections with parent_id=0
         start new tracks. Detections with parent_id!=0 continue the parent's track.
+
+        Parameters
+        ----------
+        csv_data : np.ndarray
+            Numerical data array with columns [id, t, y, x, parent_id].
 
         Returns
         -------
         dict
             Mapping from id to track_id.
         """
-        # Sort by t to process in temporal order
-        csv_df = csv_df.sort_values("t").reset_index(drop=True)
+        # Sort by t (column 1) to process in temporal order
+        sorted_indices = np.argsort(csv_data[:, 1])
+        sorted_data = csv_data[sorted_indices]
 
         id_to_track = {}
         next_track_id = 0
 
-        for _, row in csv_df.iterrows():
-            id_ = int(row["id"])
-            parent_id = int(row["parent_id"])
+        for row in sorted_data:
+            id_ = int(row[0])  # id column
+            parent_id = int(row[4])  # parent_id column
 
             if parent_id == 0:
                 # New track starts
@@ -164,8 +167,8 @@ class HOTAAdapter(BaseMetricAdapter):
         self,
         pred_arr: np.ndarray,
         target_arr: np.ndarray,
-        pred_csv: pd.DataFrame,
-        target_csv: pd.DataFrame,
+        pred_csv: np.ndarray,
+        target_csv: np.ndarray,
     ) -> dict[str, Any]:
         """Prepare data in TrackEval HOTA format."""
         # Build track mappings
@@ -231,6 +234,144 @@ class HOTAAdapter(BaseMetricAdapter):
             data["num_tracker_dets"] += len(pred_track_ids_frame)
 
         return data
+
+    def find_association_errors(
+        self, iou_threshold: float | None = None
+    ) -> list[dict[str, Any]]:
+        """Find locations where predicted links differ from ground truth.
+
+        This identifies detections where the predicted track assignment doesn't
+        match the ground truth track assignment, helping debug tracking errors.
+
+        Parameters
+        ----------
+        iou_threshold : float, optional
+            IoU threshold for matching detections. Defaults to self.iou_threshold.
+
+        Returns
+        -------
+        list[dict]
+            List of association errors, each containing:
+            - t: Frame index
+            - y: Y coordinate (centroid)
+            - x: X coordinate (centroid)
+            - detection_id: The detection ID in the segmentation
+            - gt_track_id: Ground truth track ID
+            - pred_track_id: Predicted track ID
+            - expected_pred_track: The pred track that should match this GT track
+            - error_type: 'id_switch' if detection assigned to wrong track,
+                         'fragmentation' if GT track split across pred tracks
+        """
+        if iou_threshold is None:
+            iou_threshold = self.iou_threshold
+
+        pred_arr, target_arr, pred_csv, target_csv = self._load_data()
+
+        # Build track mappings
+        pred_id_to_track = self._build_tracks(pred_csv)
+        target_id_to_track = self._build_tracks(target_csv)
+
+        # Build detection ID to (y, x) coordinate mapping from CSV
+        # CSV columns: [id, t, y, x, parent_id]
+        target_id_to_coords = {
+            int(row[0]): (float(row[2]), float(row[3])) for row in target_csv
+        }
+
+        n_frames = pred_arr.shape[0]
+
+        # First pass: count overlap between GT tracks and pred tracks
+        # track_overlap[gt_track][pred_track] = count of matched detections
+        track_overlap: dict[int, dict[int, int]] = {}
+
+        matched_detections = []  # Store for second pass
+
+        for t in tqdm(range(n_frames), desc="Analyzing associations"):
+            pred_frame = pred_arr[t]
+            target_frame = target_arr[t]
+
+            # Get detection IDs
+            pred_ids_in_frame = [int(x) for x in np.unique(pred_frame) if x != 0]
+            target_ids_in_frame = [int(x) for x in np.unique(target_frame) if x != 0]
+
+            # Filter to valid IDs (present in CSV)
+            target_ids_valid = [
+                uid for uid in target_ids_in_frame if uid in target_id_to_track
+            ]
+            pred_ids_valid = [
+                uid for uid in pred_ids_in_frame if uid in pred_id_to_track
+            ]
+
+            if not target_ids_valid or not pred_ids_valid:
+                continue
+
+            # Compute IoU matrix
+            iou_matrix = self._compute_iou_matrix(
+                pred_frame, target_frame, pred_ids_valid, target_ids_valid
+            )
+
+            # Match detections based on IoU threshold
+            for i, gt_det_id in enumerate(target_ids_valid):
+                # Find best matching pred detection
+                best_j = np.argmax(iou_matrix[i])
+                if iou_matrix[i, best_j] >= iou_threshold:
+                    pred_det_id = pred_ids_valid[best_j]
+                    gt_track = target_id_to_track[gt_det_id]
+                    pred_track = pred_id_to_track[pred_det_id]
+
+                    # Count overlap
+                    if gt_track not in track_overlap:
+                        track_overlap[gt_track] = {}
+                    track_overlap[gt_track][pred_track] = (
+                        track_overlap[gt_track].get(pred_track, 0) + 1
+                    )
+
+                    # Store for second pass
+                    coords = target_id_to_coords.get(gt_det_id, (0.0, 0.0))
+                    matched_detections.append(
+                        {
+                            "t": t,
+                            "y": coords[0],
+                            "x": coords[1],
+                            "detection_id": gt_det_id,
+                            "gt_track_id": gt_track,
+                            "pred_track_id": pred_track,
+                        }
+                    )
+
+        # Build optimal GT track → pred track mapping (most common assignment)
+        gt_to_pred_track: dict[int, int] = {}
+        for gt_track, pred_counts in track_overlap.items():
+            if pred_counts:
+                gt_to_pred_track[gt_track] = max(pred_counts, key=pred_counts.get)
+
+        # Second pass: find errors
+        errors = []
+        for det in matched_detections:
+            gt_track = det["gt_track_id"]
+            pred_track = det["pred_track_id"]
+            expected_pred = gt_to_pred_track.get(gt_track)
+
+            if expected_pred is not None and pred_track != expected_pred:
+                # This is an association error
+                error_type = "id_switch"
+                # Check if this GT track is fragmented (appears in multiple pred tracks)
+                if len(track_overlap.get(gt_track, {})) > 1:
+                    error_type = "fragmentation"
+
+                errors.append(
+                    {
+                        "t": det["t"],
+                        "y": det["y"],
+                        "x": det["x"],
+                        "detection_id": det["detection_id"],
+                        "gt_track_id": gt_track,
+                        "pred_track_id": pred_track,
+                        "expected_pred_track": expected_pred,
+                        "error_type": error_type,
+                    }
+                )
+
+        return errors
 
     def compute(self) -> dict[str, Any]:
         """Compute HOTA and Identity metrics.

@@ -13,11 +13,11 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "numba",
-    "pandas",
     "scipy",
     "tqdm",
     "zarr",
     "trackeval",
+    "data_utils @ git+ssh://git@github.com/lmanan/data_utils.git", # data loading utilities   
 ]
 
 [project.optional-dependencies]
