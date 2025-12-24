@@ -76,9 +76,7 @@ class HOTAAdapter(BaseMetricAdapter):
         np.ndarray
             Numerical data array with columns [id, t, y, x, parent_id].
         """
-        numerical_data, _, _, _ = load_csv_data(
-            str(csv_path), sequences=[self.group]
-        )
+        numerical_data, _, _, _ = load_csv_data(str(csv_path), sequences=[self.group])
         return numerical_data
 
     def _load_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -235,8 +233,45 @@ class HOTAAdapter(BaseMetricAdapter):
 
         return data
 
+    def _save_errors_to_csv(
+        self, errors: list[dict[str, Any]], output_path: str | Path
+    ) -> None:
+        """Save association errors to a CSV file.
+
+        Parameters
+        ----------
+        errors : list[dict]
+            List of error dictionaries from find_association_errors.
+        output_path : str or Path
+            Path to save the CSV file.
+        """
+        output_path = Path(output_path)
+        if not errors:
+            # Write empty file with header
+            with open(output_path, "w") as f:
+                f.write(
+                    "# t y x detection_id gt_track_id pred_track_id "
+                    "expected_pred_track error_type\n"
+                )
+            return
+
+        with open(output_path, "w") as f:
+            f.write(
+                "# t y x detection_id gt_track_id pred_track_id "
+                "expected_pred_track error_type\n"
+            )
+            for err in errors:
+                f.write(
+                    f"{err['t']} {err['y']:.3f} {err['x']:.3f} "
+                    f"{err['detection_id']} {err['gt_track_id']} "
+                    f"{err['pred_track_id']} {err['expected_pred_track']} "
+                    f"{err['error_type']}\n"
+                )
+
     def find_association_errors(
-        self, iou_threshold: float | None = None
+        self,
+        iou_threshold: float | None = None,
+        output_csv: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         """Find locations where predicted links differ from ground truth.
 
@@ -247,6 +282,8 @@ class HOTAAdapter(BaseMetricAdapter):
         ----------
         iou_threshold : float, optional
             IoU threshold for matching detections. Defaults to self.iou_threshold.
+        output_csv : str or Path, optional
+            If provided, save errors to this CSV file.
 
         Returns
         -------
@@ -370,6 +407,9 @@ class HOTAAdapter(BaseMetricAdapter):
                         "error_type": error_type,
                     }
                 )
+
+        if output_csv is not None:
+            self._save_errors_to_csv(errors, output_csv)
 
         return errors
 
