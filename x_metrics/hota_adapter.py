@@ -79,14 +79,20 @@ class HOTAAdapter(BaseMetricAdapter):
         numerical_data, *_ = load_csv_data(str(csv_path), sequences=[self.group])
         return numerical_data
 
-    def _load_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Load zarr arrays and CSV tracking data."""
+    def _load_data(
+        self,
+    ) -> tuple[zarr.Array, zarr.Array, np.ndarray, np.ndarray]:
+        """Load zarr arrays (lazy) and CSV tracking data.
+
+        Zarr arrays are returned without loading into memory - frames are
+        loaded on-demand when accessed during iteration.
+        """
         root = zarr.open(self.zarr_path, mode="r")
         group = root[self.group]
 
-        # Load datasets and take first channel (C=1)
-        pred_arr = np.asarray(group[self.pred_dataset][0])
-        target_arr = np.asarray(group[self.target_dataset][0])
+        # Keep as zarr arrays for lazy loading (first channel, C=1)
+        pred_arr = group[self.pred_dataset][0]
+        target_arr = group[self.target_dataset][0]
 
         pred_csv = self._load_csv(self.pred_csv_path)
         target_csv = self._load_csv(self.target_csv_path)
@@ -167,29 +173,8 @@ class HOTAAdapter(BaseMetricAdapter):
         target_arr: np.ndarray,
         pred_csv: np.ndarray,
         target_csv: np.ndarray,
-        collect_error_data: bool = False,
-    ) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
-        """Prepare data in TrackEval HOTA format.
-
-        Parameters
-        ----------
-        pred_arr : np.ndarray
-            Predicted segmentation array.
-        target_arr : np.ndarray
-            Ground truth segmentation array.
-        pred_csv : np.ndarray
-            Predicted tracks CSV data.
-        target_csv : np.ndarray
-            Ground truth tracks CSV data.
-        collect_error_data : bool, optional
-            If True, also collect data needed for association error finding.
-
-        Returns
-        -------
-        dict or tuple
-            If collect_error_data is False, returns TrackEval data dict.
-            If collect_error_data is True, returns (trackeval_data, error_data) tuple.
-        """
+    ) -> dict[str, Any]:
+        """Prepare data in TrackEval HOTA format."""
         # Build track mappings
         pred_id_to_track = self._build_tracks(pred_csv)
         target_id_to_track = self._build_tracks(target_csv)
@@ -211,14 +196,6 @@ class HOTAAdapter(BaseMetricAdapter):
             "tracker_ids": [],
             "similarity_scores": [],
         }
-
-        # Additional structures for error finding
-        if collect_error_data:
-            target_id_to_coords = {
-                int(row[0]): (float(row[2]), float(row[3])) for row in target_csv
-            }
-            track_overlap: dict[int, dict[int, int]] = {}
-            matched_detections: list[dict[str, Any]] = []
 
         for t in tqdm(range(n_frames), desc="Processing frames"):
             pred_frame = pred_arr[t]
@@ -258,87 +235,118 @@ class HOTAAdapter(BaseMetricAdapter):
             data["num_gt_dets"] += len(gt_track_ids_frame)
             data["num_tracker_dets"] += len(pred_track_ids_frame)
 
-            # Collect error data if requested
-            if collect_error_data and target_ids_valid and pred_ids_valid:
-                for i, gt_det_id in enumerate(target_ids_valid):
-                    best_j = np.argmax(similarity[i])
-                    if similarity[i, best_j] >= self.iou_threshold:
-                        pred_det_id = pred_ids_valid[best_j]
-                        gt_track = target_id_to_track[gt_det_id]
-                        pred_track = pred_id_to_track[pred_det_id]
-
-                        # Count overlap
-                        if gt_track not in track_overlap:
-                            track_overlap[gt_track] = {}
-                        track_overlap[gt_track][pred_track] = (
-                            track_overlap[gt_track].get(pred_track, 0) + 1
-                        )
-
-                        # Store matched detection
-                        coords = target_id_to_coords.get(gt_det_id, (0.0, 0.0))
-                        matched_detections.append(
-                            {
-                                "t": t,
-                                "y": coords[0],
-                                "x": coords[1],
-                                "detection_id": gt_det_id,
-                                "gt_track_id": gt_track,
-                                "pred_track_id": pred_track,
-                            }
-                        )
-
-        if collect_error_data:
-            error_data = {
-                "track_overlap": track_overlap,
-                "matched_detections": matched_detections,
-            }
-            return data, error_data
-
         return data
+
+    def _find_link_errors(
+        self,
+        target_csv: np.ndarray,
+        pred_csv: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        """Find link errors by comparing parent_ids between GT and pred CSVs.
+
+        This directly compares the parent_id values for each detection to find
+        where the linking differs between ground truth and prediction.
+
+        Parameters
+        ----------
+        target_csv : np.ndarray
+            Ground truth CSV data with columns [id, t, y, x, parent_id].
+        pred_csv : np.ndarray
+            Predicted CSV data with columns [id, t, y, x, parent_id].
+
+        Returns
+        -------
+        list[dict]
+            List of link errors, each containing:
+            - t: Frame index
+            - y: Y coordinate
+            - x: X coordinate
+            - detection_id: The detection ID
+            - gt_parent_id: Ground truth parent ID
+            - pred_parent_id: Predicted parent ID
+            - error_type: 'false_negative' (missed link), 'false_positive' (extra link),
+                         or 'wrong_link' (linked to wrong parent)
+        """
+        # Build mappings from detection ID to (t, y, x, parent_id)
+        gt_info = {
+            int(row[0]): {
+                "t": int(row[1]),
+                "y": float(row[2]),
+                "x": float(row[3]),
+                "parent_id": int(row[4]),
+            }
+            for row in target_csv
+        }
+        pred_parents = {int(row[0]): int(row[4]) for row in pred_csv}
+
+        errors = []
+        for det_id, info in gt_info.items():
+            gt_parent = info["parent_id"]
+            pred_parent = pred_parents.get(det_id)
+
+            if pred_parent is None:
+                # Detection not in pred CSV - skip
+                continue
+
+            if gt_parent != pred_parent:
+                # Determine error type
+                if gt_parent == 0 and pred_parent != 0:
+                    error_type = (
+                        "false_positive"  # Pred added a link that shouldn't exist
+                    )
+                elif gt_parent != 0 and pred_parent == 0:
+                    error_type = "false_negative"  # Pred missed a link
+                else:
+                    error_type = "wrong_link"  # Pred linked to wrong parent
+
+                errors.append(
+                    {
+                        "t": info["t"],
+                        "y": info["y"],
+                        "x": info["x"],
+                        "detection_id": det_id,
+                        "gt_parent_id": gt_parent,
+                        "pred_parent_id": pred_parent,
+                        "error_type": error_type,
+                    }
+                )
+
+        # Sort by time, then detection_id
+        errors.sort(key=lambda e: (e["t"], e["detection_id"]))
+        return errors
 
     def _save_errors_to_csv(
         self, errors: list[dict[str, Any]], output_path: str | Path
     ) -> None:
-        """Save association errors to a CSV file.
+        """Save link errors to a CSV file.
 
         Parameters
         ----------
         errors : list[dict]
-            List of error dictionaries from find_association_errors.
+            List of error dictionaries from _find_link_errors.
         output_path : str or Path
             Path to save the CSV file.
         """
         output_path = Path(output_path)
-        if not errors:
-            # Write empty file with header
-            with open(output_path, "w") as f:
-                f.write(
-                    "# t y x detection_id gt_track_id pred_track_id "
-                    "expected_pred_track error_type\n"
-                )
-            return
+        header = "# t y x detection_id gt_parent_id pred_parent_id error_type\n"
 
         with open(output_path, "w") as f:
-            f.write(
-                "# t y x detection_id gt_track_id pred_track_id "
-                "expected_pred_track error_type\n"
-            )
+            f.write(header)
             for err in errors:
                 f.write(
                     f"{err['t']} {err['y']:.3f} {err['x']:.3f} "
-                    f"{err['detection_id']} {err['gt_track_id']} "
-                    f"{err['pred_track_id']} {err['expected_pred_track']} "
-                    f"{err['error_type']}\n"
+                    f"{err['detection_id']} {err['gt_parent_id']} "
+                    f"{err['pred_parent_id']} {err['error_type']}\n"
                 )
 
-    def find_association_errors(
+    def find_link_errors(
         self,
         output_csv: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         """Find locations where predicted links differ from ground truth.
 
         This is a convenience method that calls compute(find_errors=True) and
-        returns just the association errors. Uses self.iou_threshold for matching.
+        returns just the link errors.
 
         Parameters
         ----------
@@ -348,19 +356,18 @@ class HOTAAdapter(BaseMetricAdapter):
         Returns
         -------
         list[dict]
-            List of association errors, each containing:
+            List of link errors, each containing:
             - t: Frame index
-            - y: Y coordinate (centroid)
-            - x: X coordinate (centroid)
-            - detection_id: The detection ID in the segmentation
-            - gt_track_id: Ground truth track ID
-            - pred_track_id: Predicted track ID
-            - expected_pred_track: The pred track that should match this GT track
-            - error_type: 'id_switch' if detection assigned to wrong track,
-                         'fragmentation' if GT track split across pred tracks
+            - y: Y coordinate
+            - x: X coordinate
+            - detection_id: The detection ID
+            - gt_parent_id: Ground truth parent ID
+            - pred_parent_id: Predicted parent ID
+            - error_type: 'false_negative' (missed link), 'false_positive' (extra link),
+                         or 'wrong_link' (linked to wrong parent)
         """
         result = self.compute(find_errors=True, output_csv=output_csv)
-        return result["association_errors"]
+        return result["link_errors"]
 
     def compute(
         self,
@@ -372,7 +379,7 @@ class HOTAAdapter(BaseMetricAdapter):
         Parameters
         ----------
         find_errors : bool, optional
-            If True, also find and return association errors. Default is False.
+            If True, also find and return link errors. Default is False.
         output_csv : str or Path, optional
             If provided (and find_errors=True), save errors to this CSV file.
 
@@ -391,18 +398,11 @@ class HOTAAdapter(BaseMetricAdapter):
             - IDF1: Identity F1 score
             - IDP: Identity precision
             - IDR: Identity recall
-            - association_errors: (only if find_errors=True) List of association errors
+            - link_errors: (only if find_errors=True) List of link errors
         """
         pred_arr, target_arr, pred_csv, target_csv = self._load_data()
 
-        if find_errors:
-            data, error_data = self._prepare_trackeval_data(
-                pred_arr, target_arr, pred_csv, target_csv, collect_error_data=True
-            )
-        else:
-            data = self._prepare_trackeval_data(
-                pred_arr, target_arr, pred_csv, target_csv
-            )
+        data = self._prepare_trackeval_data(pred_arr, target_arr, pred_csv, target_csv)
 
         # Run HOTA computation
         hota_results = self._hota_metric.eval_sequence(data)
@@ -439,45 +439,13 @@ class HOTAAdapter(BaseMetricAdapter):
             if key in hota_results
         }
 
-        # Process association errors if requested
+        # Find link errors if requested
         if find_errors:
-            track_overlap = error_data["track_overlap"]
-            matched_detections = error_data["matched_detections"]
-
-            # Build optimal GT track → pred track mapping (most common assignment)
-            gt_to_pred_track: dict[int, int] = {}
-            for gt_track, pred_counts in track_overlap.items():
-                if pred_counts:
-                    gt_to_pred_track[gt_track] = max(pred_counts, key=pred_counts.get)
-
-            # Find errors
-            errors = []
-            for det in matched_detections:
-                gt_track = det["gt_track_id"]
-                pred_track = det["pred_track_id"]
-                expected_pred = gt_to_pred_track.get(gt_track)
-
-                if expected_pred is not None and pred_track != expected_pred:
-                    error_type = "id_switch"
-                    if len(track_overlap.get(gt_track, {})) > 1:
-                        error_type = "fragmentation"
-
-                    errors.append(
-                        {
-                            "t": det["t"],
-                            "y": det["y"],
-                            "x": det["x"],
-                            "detection_id": det["detection_id"],
-                            "gt_track_id": gt_track,
-                            "pred_track_id": pred_track,
-                            "expected_pred_track": expected_pred,
-                            "error_type": error_type,
-                        }
-                    )
+            errors = self._find_link_errors(target_csv, pred_csv)
 
             if output_csv is not None:
                 self._save_errors_to_csv(errors, output_csv)
 
-            output["association_errors"] = errors
+            output["link_errors"] = errors
 
         return output
