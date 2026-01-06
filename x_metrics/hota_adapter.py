@@ -76,7 +76,7 @@ class HOTAAdapter(BaseMetricAdapter):
         np.ndarray
             Numerical data array with columns [id, t, y, x, parent_id].
         """
-        numerical_data, _, _, _ = load_csv_data(str(csv_path), sequences=[self.group])
+        numerical_data, *_ = load_csv_data(str(csv_path), sequences=[self.group])
         return numerical_data
 
     def _load_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
