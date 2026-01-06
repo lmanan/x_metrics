@@ -167,8 +167,29 @@ class HOTAAdapter(BaseMetricAdapter):
         target_arr: np.ndarray,
         pred_csv: np.ndarray,
         target_csv: np.ndarray,
-    ) -> dict[str, Any]:
-        """Prepare data in TrackEval HOTA format."""
+        collect_error_data: bool = False,
+    ) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
+        """Prepare data in TrackEval HOTA format.
+
+        Parameters
+        ----------
+        pred_arr : np.ndarray
+            Predicted segmentation array.
+        target_arr : np.ndarray
+            Ground truth segmentation array.
+        pred_csv : np.ndarray
+            Predicted tracks CSV data.
+        target_csv : np.ndarray
+            Ground truth tracks CSV data.
+        collect_error_data : bool, optional
+            If True, also collect data needed for association error finding.
+
+        Returns
+        -------
+        dict or tuple
+            If collect_error_data is False, returns TrackEval data dict.
+            If collect_error_data is True, returns (trackeval_data, error_data) tuple.
+        """
         # Build track mappings
         pred_id_to_track = self._build_tracks(pred_csv)
         target_id_to_track = self._build_tracks(target_csv)
@@ -190,6 +211,14 @@ class HOTAAdapter(BaseMetricAdapter):
             "tracker_ids": [],
             "similarity_scores": [],
         }
+
+        # Additional structures for error finding
+        if collect_error_data:
+            target_id_to_coords = {
+                int(row[0]): (float(row[2]), float(row[3])) for row in target_csv
+            }
+            track_overlap: dict[int, dict[int, int]] = {}
+            matched_detections: list[dict[str, Any]] = []
 
         for t in tqdm(range(n_frames), desc="Processing frames"):
             pred_frame = pred_arr[t]
@@ -213,16 +242,14 @@ class HOTAAdapter(BaseMetricAdapter):
 
             gt_track_ids_frame = gt_track_ids_frame[valid_gt]
             pred_track_ids_frame = pred_track_ids_frame[valid_pred]
-            target_ids_in_frame = [
+            target_ids_valid = [
                 uid for uid, v in zip(target_ids_in_frame, valid_gt) if v
             ]
-            pred_ids_in_frame = [
-                uid for uid, v in zip(pred_ids_in_frame, valid_pred) if v
-            ]
+            pred_ids_valid = [uid for uid, v in zip(pred_ids_in_frame, valid_pred) if v]
 
             # Compute IoU similarity matrix
             similarity = self._compute_iou_matrix(
-                pred_frame, target_frame, pred_ids_in_frame, target_ids_in_frame
+                pred_frame, target_frame, pred_ids_valid, target_ids_valid
             )
 
             data["gt_ids"].append(gt_track_ids_frame)
@@ -230,6 +257,42 @@ class HOTAAdapter(BaseMetricAdapter):
             data["similarity_scores"].append(similarity)
             data["num_gt_dets"] += len(gt_track_ids_frame)
             data["num_tracker_dets"] += len(pred_track_ids_frame)
+
+            # Collect error data if requested
+            if collect_error_data and target_ids_valid and pred_ids_valid:
+                for i, gt_det_id in enumerate(target_ids_valid):
+                    best_j = np.argmax(similarity[i])
+                    if similarity[i, best_j] >= self.iou_threshold:
+                        pred_det_id = pred_ids_valid[best_j]
+                        gt_track = target_id_to_track[gt_det_id]
+                        pred_track = pred_id_to_track[pred_det_id]
+
+                        # Count overlap
+                        if gt_track not in track_overlap:
+                            track_overlap[gt_track] = {}
+                        track_overlap[gt_track][pred_track] = (
+                            track_overlap[gt_track].get(pred_track, 0) + 1
+                        )
+
+                        # Store matched detection
+                        coords = target_id_to_coords.get(gt_det_id, (0.0, 0.0))
+                        matched_detections.append(
+                            {
+                                "t": t,
+                                "y": coords[0],
+                                "x": coords[1],
+                                "detection_id": gt_det_id,
+                                "gt_track_id": gt_track,
+                                "pred_track_id": pred_track,
+                            }
+                        )
+
+        if collect_error_data:
+            error_data = {
+                "track_overlap": track_overlap,
+                "matched_detections": matched_detections,
+            }
+            return data, error_data
 
         return data
 
@@ -270,18 +333,15 @@ class HOTAAdapter(BaseMetricAdapter):
 
     def find_association_errors(
         self,
-        iou_threshold: float | None = None,
         output_csv: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         """Find locations where predicted links differ from ground truth.
 
-        This identifies detections where the predicted track assignment doesn't
-        match the ground truth track assignment, helping debug tracking errors.
+        This is a convenience method that calls compute(find_errors=True) and
+        returns just the association errors. Uses self.iou_threshold for matching.
 
         Parameters
         ----------
-        iou_threshold : float, optional
-            IoU threshold for matching detections. Defaults to self.iou_threshold.
         output_csv : str or Path, optional
             If provided, save errors to this CSV file.
 
@@ -299,122 +359,22 @@ class HOTAAdapter(BaseMetricAdapter):
             - error_type: 'id_switch' if detection assigned to wrong track,
                          'fragmentation' if GT track split across pred tracks
         """
-        if iou_threshold is None:
-            iou_threshold = self.iou_threshold
+        result = self.compute(find_errors=True, output_csv=output_csv)
+        return result["association_errors"]
 
-        pred_arr, target_arr, pred_csv, target_csv = self._load_data()
-
-        # Build track mappings
-        pred_id_to_track = self._build_tracks(pred_csv)
-        target_id_to_track = self._build_tracks(target_csv)
-
-        # Build detection ID to (y, x) coordinate mapping from CSV
-        # CSV columns: [id, t, y, x, parent_id]
-        target_id_to_coords = {
-            int(row[0]): (float(row[2]), float(row[3])) for row in target_csv
-        }
-
-        n_frames = pred_arr.shape[0]
-
-        # First pass: count overlap between GT tracks and pred tracks
-        # track_overlap[gt_track][pred_track] = count of matched detections
-        track_overlap: dict[int, dict[int, int]] = {}
-
-        matched_detections = []  # Store for second pass
-
-        for t in tqdm(range(n_frames), desc="Analyzing associations"):
-            pred_frame = pred_arr[t]
-            target_frame = target_arr[t]
-
-            # Get detection IDs
-            pred_ids_in_frame = [int(x) for x in np.unique(pred_frame) if x != 0]
-            target_ids_in_frame = [int(x) for x in np.unique(target_frame) if x != 0]
-
-            # Filter to valid IDs (present in CSV)
-            target_ids_valid = [
-                uid for uid in target_ids_in_frame if uid in target_id_to_track
-            ]
-            pred_ids_valid = [
-                uid for uid in pred_ids_in_frame if uid in pred_id_to_track
-            ]
-
-            if not target_ids_valid or not pred_ids_valid:
-                continue
-
-            # Compute IoU matrix
-            iou_matrix = self._compute_iou_matrix(
-                pred_frame, target_frame, pred_ids_valid, target_ids_valid
-            )
-
-            # Match detections based on IoU threshold
-            for i, gt_det_id in enumerate(target_ids_valid):
-                # Find best matching pred detection
-                best_j = np.argmax(iou_matrix[i])
-                if iou_matrix[i, best_j] >= iou_threshold:
-                    pred_det_id = pred_ids_valid[best_j]
-                    gt_track = target_id_to_track[gt_det_id]
-                    pred_track = pred_id_to_track[pred_det_id]
-
-                    # Count overlap
-                    if gt_track not in track_overlap:
-                        track_overlap[gt_track] = {}
-                    track_overlap[gt_track][pred_track] = (
-                        track_overlap[gt_track].get(pred_track, 0) + 1
-                    )
-
-                    # Store for second pass
-                    coords = target_id_to_coords.get(gt_det_id, (0.0, 0.0))
-                    matched_detections.append(
-                        {
-                            "t": t,
-                            "y": coords[0],
-                            "x": coords[1],
-                            "detection_id": gt_det_id,
-                            "gt_track_id": gt_track,
-                            "pred_track_id": pred_track,
-                        }
-                    )
-
-        # Build optimal GT track → pred track mapping (most common assignment)
-        gt_to_pred_track: dict[int, int] = {}
-        for gt_track, pred_counts in track_overlap.items():
-            if pred_counts:
-                gt_to_pred_track[gt_track] = max(pred_counts, key=pred_counts.get)
-
-        # Second pass: find errors
-        errors = []
-        for det in matched_detections:
-            gt_track = det["gt_track_id"]
-            pred_track = det["pred_track_id"]
-            expected_pred = gt_to_pred_track.get(gt_track)
-
-            if expected_pred is not None and pred_track != expected_pred:
-                # This is an association error
-                error_type = "id_switch"
-                # Check if this GT track is fragmented (appears in multiple pred tracks)
-                if len(track_overlap.get(gt_track, {})) > 1:
-                    error_type = "fragmentation"
-
-                errors.append(
-                    {
-                        "t": det["t"],
-                        "y": det["y"],
-                        "x": det["x"],
-                        "detection_id": det["detection_id"],
-                        "gt_track_id": gt_track,
-                        "pred_track_id": pred_track,
-                        "expected_pred_track": expected_pred,
-                        "error_type": error_type,
-                    }
-                )
-
-        if output_csv is not None:
-            self._save_errors_to_csv(errors, output_csv)
-
-        return errors
-
-    def compute(self) -> dict[str, Any]:
+    def compute(
+        self,
+        find_errors: bool = False,
+        output_csv: str | Path | None = None,
+    ) -> dict[str, Any]:
         """Compute HOTA and Identity metrics.
+
+        Parameters
+        ----------
+        find_errors : bool, optional
+            If True, also find and return association errors. Default is False.
+        output_csv : str or Path, optional
+            If provided (and find_errors=True), save errors to this CSV file.
 
         Returns
         -------
@@ -431,9 +391,18 @@ class HOTAAdapter(BaseMetricAdapter):
             - IDF1: Identity F1 score
             - IDP: Identity precision
             - IDR: Identity recall
+            - association_errors: (only if find_errors=True) List of association errors
         """
         pred_arr, target_arr, pred_csv, target_csv = self._load_data()
-        data = self._prepare_trackeval_data(pred_arr, target_arr, pred_csv, target_csv)
+
+        if find_errors:
+            data, error_data = self._prepare_trackeval_data(
+                pred_arr, target_arr, pred_csv, target_csv, collect_error_data=True
+            )
+        else:
+            data = self._prepare_trackeval_data(
+                pred_arr, target_arr, pred_csv, target_csv
+            )
 
         # Run HOTA computation
         hota_results = self._hota_metric.eval_sequence(data)
@@ -469,5 +438,46 @@ class HOTAAdapter(BaseMetricAdapter):
             for key in ["HOTA", "DetA", "AssA"]
             if key in hota_results
         }
+
+        # Process association errors if requested
+        if find_errors:
+            track_overlap = error_data["track_overlap"]
+            matched_detections = error_data["matched_detections"]
+
+            # Build optimal GT track → pred track mapping (most common assignment)
+            gt_to_pred_track: dict[int, int] = {}
+            for gt_track, pred_counts in track_overlap.items():
+                if pred_counts:
+                    gt_to_pred_track[gt_track] = max(pred_counts, key=pred_counts.get)
+
+            # Find errors
+            errors = []
+            for det in matched_detections:
+                gt_track = det["gt_track_id"]
+                pred_track = det["pred_track_id"]
+                expected_pred = gt_to_pred_track.get(gt_track)
+
+                if expected_pred is not None and pred_track != expected_pred:
+                    error_type = "id_switch"
+                    if len(track_overlap.get(gt_track, {})) > 1:
+                        error_type = "fragmentation"
+
+                    errors.append(
+                        {
+                            "t": det["t"],
+                            "y": det["y"],
+                            "x": det["x"],
+                            "detection_id": det["detection_id"],
+                            "gt_track_id": gt_track,
+                            "pred_track_id": pred_track,
+                            "expected_pred_track": expected_pred,
+                            "error_type": error_type,
+                        }
+                    )
+
+            if output_csv is not None:
+                self._save_errors_to_csv(errors, output_csv)
+
+            output["association_errors"] = errors
 
         return output
