@@ -5,19 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "x_metrics"
 version = "0.1.0"
-description = "Metrics for evaluating deep learning experiments"
+description = "Suite of metrics"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Manan Lalit", email = "manan.lalit@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
-    "numpy",
-    "numba",
-    "scipy",
-    "tqdm",
-    "zarr",
-    "trackeval",
-    "data_utils @ git+ssh://git@github.com/lmanan/data_utils.git", # data loading utilities   
+   "traccuracy", 
+   "motile",
+   "trackeval @ git+https://github.com/JonathonLuiten/TrackEval.git"
 ]
 
 [project.optional-dependencies]
