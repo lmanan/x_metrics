@@ -16,6 +16,7 @@ from tqdm import tqdm
 from trackeval.metrics import HOTA, Identity
 
 from x_metrics.base_adapter import BaseMetricAdapter
+from x_metrics.segmentation_metrics import _label_overlap, relabel_sequential
 
 
 class HOTAAdapter(BaseMetricAdapter):
@@ -153,25 +154,40 @@ class HOTAAdapter(BaseMetricAdapter):
         pred_ids: list[int],
         target_ids: list[int],
     ) -> np.ndarray:
-        """Compute IoU matrix between predicted and target detections in a frame."""
+        """Compute IoU matrix between predicted and target detections in a frame.
+
+        Uses numba-optimized single-pass overlap computation for O(pixels) complexity
+        instead of O(n_pred * n_target * pixels).
+        """
         n_pred = len(pred_ids)
         n_target = len(target_ids)
 
         if n_pred == 0 or n_target == 0:
             return np.zeros((n_target, n_pred))
 
-        iou_matrix = np.zeros((n_target, n_pred))
+        # Relabel masks to sequential integers for overlap computation
+        target_relabeled, target_fwd, _ = relabel_sequential(target_mask)
+        pred_relabeled, pred_fwd, _ = relabel_sequential(pred_mask)
 
-        for i, tid in enumerate(target_ids):
-            target_region = target_mask == tid
-            for j, pid in enumerate(pred_ids):
-                pred_region = pred_mask == pid
-                intersection = np.logical_and(target_region, pred_region).sum()
-                union = np.logical_or(target_region, pred_region).sum()
-                if union > 0:
-                    iou_matrix[i, j] = intersection / union
+        # Single-pass overlap computation (numba JIT compiled)
+        overlap = _label_overlap(target_relabeled, pred_relabeled)
 
-        return iou_matrix
+        # Vectorized IoU: intersection / (size_a + size_b - intersection)
+        n_pixels_target = np.sum(overlap, axis=1, keepdims=True)
+        n_pixels_pred = np.sum(overlap, axis=0, keepdims=True)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            iou_full = overlap / (n_pixels_target + n_pixels_pred - overlap)
+        iou_full = np.nan_to_num(iou_full, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Map original IDs to relabeled indices and extract relevant submatrix
+        # target_fwd maps original_id -> relabeled_id, we need indices for target_ids
+        target_indices = [target_fwd[tid] for tid in target_ids]
+        pred_indices = [pred_fwd[pid] for pid in pred_ids]
+
+        # Extract the IoU values for the requested ID pairs
+        iou_matrix = iou_full[np.ix_(target_indices, pred_indices)]
+
+        return iou_matrix.astype(np.float64)
 
     def _prepare_trackeval_data(
         self,
