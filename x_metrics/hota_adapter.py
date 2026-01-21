@@ -5,10 +5,12 @@ from typing import Any
 
 import numpy as np
 
-# Monkey-patch for trackeval compatibility with NumPy 1.24+
-# trackeval uses np.float which was removed in NumPy 1.24
+# Monkey-patch for trackeval compatibility with NumPy 1.24+/2.0+
+# trackeval uses np.float and np.int which were removed
 if not hasattr(np, "float"):
     np.float = np.float64
+if not hasattr(np, "int"):
+    np.int = np.int64
 
 import zarr
 from data_utils import load_csv_data
