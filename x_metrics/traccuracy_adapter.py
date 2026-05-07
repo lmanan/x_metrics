@@ -33,14 +33,18 @@ class TraccuracyAdapter(BaseMetricAdapter):
     group : str
         Name of the group containing prediction and target datasets.
     pred_dataset : str
-        Name of the dataset containing predicted segmentation (shape: C T Y X, C=1).
+        Name of the dataset containing predicted segmentation.
+        Shape: C T Y X (C=1) for 2D, or C T Z Y X (C=1) for 3D.
     target_dataset : str
-        Name of the dataset containing ground truth segmentation (shape: C T Y X, C=1).
+        Name of the dataset containing ground truth segmentation.
+        Shape: C T Y X (C=1) for 2D, or C T Z Y X (C=1) for 3D.
     pred_csv_path : str or Path
-        Path to predicted tracks CSV with columns: sequence, id, t, y, x, parent_id
+        Path to predicted tracks CSV with columns: group, id, t, y, x, parent_id
+        for 2D, or group, id, t, z, y, x, parent_id for 3D
         (may have additional columns which will be dropped).
     target_csv_path : str or Path
-        Path to ground truth tracks CSV with columns: sequence, id, t, y, x, parent_id
+        Path to ground truth tracks CSV with columns: group, id, t, y, x, parent_id
+        for 2D, or group, id, t, z, y, x, parent_id for 3D
         (may have additional columns which will be dropped).
     matcher : traccuracy.matchers.Matcher
         A traccuracy Matcher object for matching detections between ground truth
@@ -48,6 +52,10 @@ class TraccuracyAdapter(BaseMetricAdapter):
         - IOUMatcher(iou_threshold=0.5, one_to_one=True): Match by segmentation IoU
         - PointMatcher(threshold=10.0): Match by point distance
         - CTCMatcher(): Cell Tracking Challenge matching
+    voxel_size : dict[str, float], optional
+        Scaling factors for spatial coordinates. Keys should be 'x', 'y', and
+        optionally 'z' for 3D data. Including 'z' enables 3D mode.
+        Default is {"x": 1.0, "y": 1.0} (2D).
     """
 
     def __init__(
@@ -59,7 +67,10 @@ class TraccuracyAdapter(BaseMetricAdapter):
         pred_csv_path: str | Path,
         target_csv_path: str | Path,
         matcher: Matcher,
+        voxel_size: dict[str, float] | None = None,
     ):
+        if voxel_size is None:
+            voxel_size = {"x": 1.0, "y": 1.0}
         self.zarr_path = Path(zarr_path)
         self.group = group
         self.pred_dataset = pred_dataset
@@ -67,18 +78,23 @@ class TraccuracyAdapter(BaseMetricAdapter):
         self.pred_csv_path = Path(pred_csv_path)
         self.target_csv_path = Path(target_csv_path)
         self.matcher = matcher
+        self.voxel_size = voxel_size
+        self.is_3d = "z" in voxel_size
 
     def _load_csv(self, csv_path: Path) -> np.ndarray:
         """Load and filter CSV tracking data.
 
-        Filters rows where sequence == group.
+        Filters rows where group == group.
 
         Returns
         -------
         np.ndarray
-            Numerical data array with columns [id, t, y, x, parent_id].
+            Numerical data array with columns [id, t, y, x, parent_id] for 2D,
+            or [id, t, z, y, x, parent_id] for 3D.
         """
-        numerical_data, *_ = load_csv_data(str(csv_path), sequences=[self.group])
+        numerical_data, *_ = load_csv_data(
+            str(csv_path), voxel_size=self.voxel_size, groups=[self.group]
+        )
         return numerical_data
 
     def _load_data(
@@ -111,9 +127,10 @@ class TraccuracyAdapter(BaseMetricAdapter):
         Parameters
         ----------
         csv_data : np.ndarray
-            Numerical data array with columns [id, t, y, x, parent_id].
+            Numerical data array with columns [id, t, y, x, parent_id] for 2D,
+            or [id, t, z, y, x, parent_id] for 3D.
         seg_arr : zarr.Array
-            Segmentation array with shape (T, Y, X).
+            Segmentation array with shape (T, Y, X) for 2D or (T, Z, Y, X) for 3D.
 
         Returns
         -------
@@ -122,26 +139,39 @@ class TraccuracyAdapter(BaseMetricAdapter):
         """
         graph = nx.DiGraph()
 
-        # Build node info mapping: id -> {t, y, x, parent_id}
+        # Column indices differ for 2D vs 3D
+        # 2D: [id, t, y, x, parent_id]
+        # 3D: [id, t, z, y, x, parent_id]
+        if self.is_3d:
+            col_z, col_y, col_x, col_parent = 2, 3, 4, 5
+        else:
+            col_y, col_x, col_parent = 2, 3, 4
+
+        # Build node info mapping
         node_info = {}
         for row in csv_data:
             node_id = int(row[0])
-            node_info[node_id] = {
+            info = {
                 "t": int(row[1]),
-                "y": float(row[2]),
-                "x": float(row[3]),
-                "parent_id": int(row[4]),
+                "y": float(row[col_y]),
+                "x": float(row[col_x]),
+                "parent_id": int(row[col_parent]),
             }
+            if self.is_3d:
+                info["z"] = float(row[col_z])
+            node_info[node_id] = info
 
         # Add nodes with attributes
         for node_id, info in node_info.items():
-            graph.add_node(
-                node_id,
-                t=info["t"],
-                y=info["y"],
-                x=info["x"],
-                segmentation_id=node_id,
-            )
+            attrs = {
+                "t": info["t"],
+                "y": info["y"],
+                "x": info["x"],
+                "segmentation_id": node_id,
+            }
+            if self.is_3d:
+                attrs["z"] = info["z"]
+            graph.add_node(node_id, **attrs)
 
         # Add edges based on parent_id relationships
         for node_id, info in node_info.items():
@@ -155,12 +185,14 @@ class TraccuracyAdapter(BaseMetricAdapter):
         print("Loading segmentation data...")
         seg_np = np.array(seg_arr)
 
+        location_keys = ("z", "y", "x") if self.is_3d else ("y", "x")
+
         return TrackingGraph(
             graph=graph,
             segmentation=seg_np,
             frame_key="t",
             label_key="segmentation_id",
-            location_keys=("y", "x"),
+            location_keys=location_keys,
         )
 
     def compute(

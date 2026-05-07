@@ -45,10 +45,10 @@ class HOTAAdapter(BaseMetricAdapter):
     target_dataset : str
         Name of the dataset containing ground truth segmentation (shape: C T Y X, C=1).
     pred_csv_path : str or Path
-        Path to predicted tracks CSV with columns: sequence, id, t, y, x, parent_id
+        Path to predicted tracks CSV with columns: group, id, t, y, x, parent_id
         (may have additional columns which will be dropped).
     target_csv_path : str or Path
-        Path to ground truth tracks CSV with columns: sequence, id, t, y, x, parent_id
+        Path to ground truth tracks CSV with columns: group, id, t, y, x, parent_id
         (may have additional columns which will be dropped).
     iou_threshold : float, optional
         IoU threshold for considering a detection as matched. Default is 0.5.
@@ -78,14 +78,14 @@ class HOTAAdapter(BaseMetricAdapter):
     def _load_csv(self, csv_path: Path) -> np.ndarray:
         """Load and filter CSV tracking data.
 
-        Filters rows where sequence == group.
+        Filters rows where group == group.
 
         Returns
         -------
         np.ndarray
             Numerical data array with columns [id, t, y, x, parent_id].
         """
-        numerical_data, *_ = load_csv_data(str(csv_path), sequences=[self.group])
+        numerical_data, *_ = load_csv_data(str(csv_path), groups=[self.group])
         return numerical_data
 
     def _load_data(
@@ -429,10 +429,10 @@ class HOTAAdapter(BaseMetricAdapter):
         data = self._prepare_trackeval_data(pred_arr, target_arr, pred_csv, target_csv)
 
         # Run HOTA computation
-        hota_results = self._hota_metric.eval_sequence(data)
+        hota_results = self._hota_metric.eval_group(data)
 
         # Run Identity computation
-        identity_results = self._identity_metric.eval_sequence(data)
+        identity_results = self._identity_metric.eval_group(data)
 
         # Extract key HOTA metrics (averaged over alpha thresholds)
         output = {}
